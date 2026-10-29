@@ -19,13 +19,16 @@ const {
 const play = require("play-dl");
 const { spawn } = require("child_process");
 
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates]
-});
-
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates
+  ]
+});
 
 const PLAYLIST_URL =
   "https://music.youtube.com/playlist?list=PLKdNkNcMbulo";
@@ -33,129 +36,63 @@ const PLAYLIST_URL =
 const commands = [
   new SlashCommandBuilder()
     .setName("play")
-    .setDescription("Play a public SoundCloud track")
+    .setDescription("Play a supported audio URL")
     .addStringOption(o =>
-      o.setName("url").setDescription("SoundCloud track URL").setRequired(true)
+      o.setName("url")
+        .setDescription("Public audio track URL")
+        .setRequired(true)
     ),
-
   new SlashCommandBuilder()
     .setName("playplaylist")
     .setDescription("Show the YouTube Music playlist"),
-
-  new SlashCommandBuilder()
-    .setName("skip")
-    .setDescription("Skip the current track"),
-
-  new SlashCommandBuilder()
-    .setName("pause")
-    .setDescription("Pause playback"),
-
-  new SlashCommandBuilder()
-    .setName("resume")
-    .setDescription("Resume playback"),
-
-  new SlashCommandBuilder()
-    .setName("queue")
-    .setDescription("Show the music queue"),
-
-  new SlashCommandBuilder()
-    .setName("shuffle")
-    .setDescription("Shuffle queued tracks"),
-
-  new SlashCommandBuilder()
-    .setName("stop")
-    .setDescription("Stop playback and clear the queue"),
-
-  new SlashCommandBuilder()
-    .setName("nowplaying")
-    .setDescription("Show the current track"),
-
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Check bot latency")
-].map(c => c.toJSON());
+  new SlashCommandBuilder().setName("skip").setDescription("Skip the current track"),
+  new SlashCommandBuilder().setName("pause").setDescription("Pause playback"),
+  new SlashCommandBuilder().setName("resume").setDescription("Resume playback"),
+  new SlashCommandBuilder().setName("queue").setDescription("Show the queue"),
+  new SlashCommandBuilder().setName("shuffle").setDescription("Shuffle the queue"),
+  new SlashCommandBuilder().setName("stop").setDescription("Stop and clear the queue"),
+  new SlashCommandBuilder().setName("nowplaying").setDescription("Show the current track"),
+  new SlashCommandBuilder().setName("ping").setDescription("Check bot latency")
+].map(command => command.toJSON());
 
 const queues = new Map();
 
 function getQueue(guildId) {
   if (!queues.has(guildId)) {
-    queues.set(guildId, {
+    const player = createAudioPlayer({
+      behaviors: { noSubscriber: NoSubscriberBehavior.Pause }
+    });
+
+    const q = {
       tracks: [],
       current: null,
       connection: null,
-      player: createAudioPlayer({
-        behaviors: {
-          noSubscriber: NoSubscriberBehavior.Pause
-        }
-      }),
-      busy: false
-    });
+      player,
+      busy: false,
+      generation: 0
+    };
 
-    const q = queues.get(guildId);
-
-    q.player.on(AudioPlayerStatus.Idle, () => {
+    player.on(AudioPlayerStatus.Idle, () => {
       q.current = null;
       q.busy = false;
       playNext(guildId).catch(console.error);
     });
 
-    q.player.on("error", error => {
-      console.error("Audio player error:", error);
+    player.on("error", error => {
+      console.error("Audio player error:", error.message);
       q.current = null;
       q.busy = false;
       playNext(guildId).catch(console.error);
     });
+
+    queues.set(guildId, q);
   }
 
   return queues.get(guildId);
 }
 
-async function playNext(guildId) {
-  const q = getQueue(guildId);
-
-  if (q.busy || q.tracks.length === 0) return;
-
-  q.busy = true;
-  const track = q.tracks.shift();
-
-  try {
-    const stream = await play.stream(track.url);
-
-    const ffmpeg = spawn("ffmpeg", [
-      "-hide_banner",
-      "-loglevel", "error",
-      "-i", "pipe:0",
-      "-f", "s16le",
-      "-ar", "48000",
-      "-ac", "2",
-      "pipe:1"
-    ]);
-
-    stream.stream.pipe(ffmpeg.stdin);
-
-    const resource = createAudioResource(ffmpeg.stdout, {
-      inputType: StreamType.Raw,
-      metadata: track
-    });
-
-    q.current = track;
-    q.player.play(resource);
-
-    ffmpeg.on("error", error => {
-      console.error("FFmpeg error:", error);
-    });
-
-  } catch (error) {
-    console.error("Could not play track:", error);
-    q.current = null;
-    q.busy = false;
-    playNext(guildId).catch(console.error);
-  }
-}
-
 async function connectToVoice(interaction) {
-  const member = interaction.member;
-  const channel = member?.voice?.channel;
+  const channel = interaction.member?.voice?.channel;
 
   if (!channel) {
     throw new Error("Join a voice channel first.");
@@ -163,7 +100,8 @@ async function connectToVoice(interaction) {
 
   const q = getQueue(interaction.guildId);
 
-  if (!q.connection) {
+  if (!q.connection ||
+      q.connection.state.status === "destroyed") {
     q.connection = joinVoiceChannel({
       channelId: channel.id,
       guildId: interaction.guildId,
@@ -188,11 +126,68 @@ async function connectToVoice(interaction) {
   return q;
 }
 
+async function playNext(guildId) {
+  const q = getQueue(guildId);
+
+  if (q.busy || q.tracks.length === 0) return;
+
+  q.busy = true;
+  const generation = q.generation;
+  const track = q.tracks.shift();
+
+  let ffmpeg;
+
+  try {
+    // Resolve the URL through play-dl's stream API.
+    const result = await play.stream(track.url);
+
+    if (generation !== q.generation) return;
+
+    ffmpeg = spawn("ffmpeg", [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", "pipe:0",
+      "-f", "s16le",
+      "-ar", "48000",
+      "-ac", "2",
+      "pipe:1"
+    ]);
+
+    result.stream.pipe(ffmpeg.stdin);
+
+    ffmpeg.on("error", error => {
+      console.error("FFmpeg error:", error.message);
+    });
+
+    ffmpeg.stderr.on("data", data => {
+      console.error("FFmpeg:", data.toString());
+    });
+
+    const resource = createAudioResource(ffmpeg.stdout, {
+      inputType: StreamType.Raw,
+      metadata: track
+    });
+
+    q.current = track;
+    q.player.play(resource);
+
+  } catch (error) {
+    if (ffmpeg) ffmpeg.kill();
+    console.error("Track playback failed:", error.message);
+    q.current = null;
+    q.busy = false;
+
+    if (generation === q.generation) {
+      playNext(guildId).catch(console.error);
+    }
+  }
+}
+
 client.once("ready", async () => {
   console.log(`Logged in as ${client.user.tag}`);
 
   if (!CLIENT_ID || !GUILD_ID) {
-    console.error("Missing CLIENT_ID or GUILD_ID environment variables.");
+    console.error("Set CLIENT_ID and GUILD_ID in hosting environment variables.");
     return;
   }
 
@@ -206,7 +201,7 @@ client.once("ready", async () => {
 
     console.log("All 10 guild slash commands registered.");
   } catch (error) {
-    console.error("Slash command registration failed:", error);
+    console.error("Command registration failed:", error);
   }
 });
 
@@ -222,7 +217,7 @@ client.on("interactionCreate", async interaction => {
 
     if (name === "playplaylist") {
       return interaction.reply(
-        `Your playlist: ${PLAYLIST_URL}\nAutomatic YouTube Music playlist playback is not implemented yet.`
+        `Playlist: ${PLAYLIST_URL}\nAutomatic playlist playback is not enabled in this version.`
       );
     }
 
@@ -231,42 +226,31 @@ client.on("interactionCreate", async interaction => {
 
       const url = interaction.options.getString("url", true);
 
-      if (!/^https?:\/\/(www\.|m\.)?soundcloud\.com\//i.test(url)) {
-        return interaction.editReply(
-          "Please provide a public SoundCloud track URL."
-        );
+      if (!/^https?:\/\//i.test(url)) {
+        return interaction.editReply("Enter a valid public URL.");
       }
 
       const q = await connectToVoice(interaction);
 
-      q.tracks.push({
-        url,
-        title: url
-      });
-
-      await interaction.editReply("Added to the queue.");
+      q.tracks.push({ url, title: url });
 
       if (!q.busy) {
         playNext(interaction.guildId).catch(console.error);
       }
 
-      return;
+      return interaction.editReply("Added to the queue. Trying to load the track...");
     }
 
     const q = getQueue(interaction.guildId);
 
     if (name === "queue") {
-      const list = q.tracks
-        .slice(0, 10)
-        .map((t, i) => `${i + 1}. ${t.title}`)
+      const upcoming = q.tracks.slice(0, 10)
+        .map((track, i) => `${i + 1}. ${track.title}`)
         .join("\n");
 
-      return interaction.reply({
-        content:
-          `**Now playing:** ${q.current?.title || "Nothing"}\n` +
-          `**Up next:**\n${list || "Queue is empty."}`,
-        allowedMentions: { parse: [] }
-      });
+      return interaction.reply(
+        `**Now playing:** ${q.current?.title || "Nothing"}\n**Up next:**\n${upcoming || "Queue is empty."}`
+      );
     }
 
     if (name === "nowplaying") {
@@ -276,24 +260,20 @@ client.on("interactionCreate", async interaction => {
     }
 
     if (name === "skip") {
-      if (!q.current) {
-        return interaction.reply("Nothing is playing.");
-      }
-
-      q.busy = false;
+      if (!q.current) return interaction.reply("Nothing is playing.");
       q.player.stop(true);
-      return interaction.reply("Skipped the current track.");
+      return interaction.reply("Skipped.");
     }
 
     if (name === "pause") {
       return interaction.reply(
-        q.player.pause() ? "Playback paused." : "Couldn't pause playback."
+        q.player.pause() ? "Paused." : "Could not pause playback."
       );
     }
 
     if (name === "resume") {
       return interaction.reply(
-        q.player.unpause() ? "Playback resumed." : "Couldn't resume playback."
+        q.player.unpause() ? "Resumed." : "Could not resume playback."
       );
     }
 
@@ -303,10 +283,11 @@ client.on("interactionCreate", async interaction => {
         [q.tracks[i], q.tracks[j]] = [q.tracks[j], q.tracks[i]];
       }
 
-      return interaction.reply("Shuffled the queue.");
+      return interaction.reply("Queue shuffled.");
     }
 
     if (name === "stop") {
+      q.generation++;
       q.tracks = [];
       q.current = null;
       q.busy = false;
@@ -317,20 +298,19 @@ client.on("interactionCreate", async interaction => {
         q.connection = null;
       }
 
-      return interaction.reply("Stopped playback and cleared the queue.");
+      return interaction.reply("Stopped and cleared the queue.");
     }
-
   } catch (error) {
-    console.error(error);
+    console.error("Command error:", error);
 
-    const message = error.message || "An unexpected error occurred.";
+    const message = `Error: ${error.message || "Unknown error"}`;
 
     if (interaction.deferred || interaction.replied) {
-      return interaction.editReply(`Error: ${message}`).catch(() => {});
+      return interaction.editReply(message).catch(() => {});
     }
 
     return interaction.reply({
-      content: `Error: ${message}`,
+      content: message,
       ephemeral: true
     }).catch(() => {});
   }
