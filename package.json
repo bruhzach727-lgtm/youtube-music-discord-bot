@@ -1,12 +1,13 @@
 {
   "name": "youtube-music-discord-bot",
   "version": "1.0.0",
-  "description": "Discord music bot with playlist support",
+  "description": "Discord music bot",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "@discordjs/voice": "^0.19.0",
     "discord.js": "^14.19.3",
     "dotenv": "^16.4.7"
   }
